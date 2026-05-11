@@ -11,11 +11,25 @@ try {
 }
 
 async function migrate() {
-  const databaseUrl = process.env.DATABASE_URL;
+  let databaseUrl = process.env.DATABASE_URL;
   
   try {
     const schemaPath = path.join(__dirname, '../../../database/schema.sql');
     const schema = fs.readFileSync(schemaPath, 'utf8');
+
+    // Construct DATABASE_URL from individual Postgres env vars if needed (Render provides these)
+    if (!databaseUrl) {
+      const pgHost = process.env.PGHOST;
+      const pgPort = process.env.PGPORT || 5432;
+      const pgUser = process.env.PGUSER;
+      const pgPassword = process.env.PGPASSWORD;
+      const pgDatabase = process.env.PGDATABASE;
+
+      if (pgHost && pgUser && pgPassword && pgDatabase) {
+        databaseUrl = `postgresql://${pgUser}:${pgPassword}@${pgHost}:${pgPort}/${pgDatabase}`;
+        console.log('🔄 Constructed DATABASE_URL from PostgreSQL environment variables');
+      }
+    }
 
     if (databaseUrl && databaseUrl.startsWith('postgresql://')) {
       // PostgreSQL migration

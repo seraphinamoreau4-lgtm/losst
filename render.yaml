@@ -15,10 +15,6 @@ services:
         value: https://laikipia-lost-found.vercel.app
       - key: PORT
         value: "5000"
-      - key: DATABASE_URL
-        fromDatabase:
-          name: laikipia-db
-          property: connectionString
 
 databases:
   - name: laikipia-db

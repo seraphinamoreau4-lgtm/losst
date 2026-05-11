@@ -21,13 +21,25 @@ let pool = null;
 
 // Initialize database connection
 async function initDatabase() {
-  const databaseUrl = process.env.DATABASE_URL;
+  let databaseUrl = process.env.DATABASE_URL;
 
-  // In production, DATABASE_URL is required
+  // In production, construct DATABASE_URL from Render's PostgreSQL env vars if needed
   if (process.env.NODE_ENV === 'production') {
-    if (!databaseUrl || !databaseUrl.startsWith('postgresql://')) {
-      console.error('❌ DATABASE_URL (PostgreSQL) is required in production');
-      throw new Error('DATABASE_URL not set or invalid');
+    if (!databaseUrl) {
+      // Try to construct from individual Postgres environment variables (Render provides these)
+      const pgHost = process.env.PGHOST;
+      const pgPort = process.env.PGPORT || 5432;
+      const pgUser = process.env.PGUSER;
+      const pgPassword = process.env.PGPASSWORD;
+      const pgDatabase = process.env.PGDATABASE;
+
+      if (pgHost && pgUser && pgPassword && pgDatabase) {
+        databaseUrl = `postgresql://${pgUser}:${pgPassword}@${pgHost}:${pgPort}/${pgDatabase}`;
+        console.log('🔄 Constructed DATABASE_URL from PostgreSQL environment variables');
+      } else {
+        console.error('❌ DATABASE_URL or PostgreSQL environment variables (PGHOST, PGUSER, PGPASSWORD, PGDATABASE) are required in production');
+        throw new Error('Database configuration missing');
+      }
     }
 
     console.log('🔄 Initializing PostgreSQL connection...');
