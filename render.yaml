@@ -1,10 +1,8 @@
 services:
   - type: web
     name: laikipia-lost-found-backend
-    env: node
-    region: oregon
-    plan: free
-    buildCommand: npm ci && npm run migrate
+    runtime: node
+    buildCommand: npm ci
     startCommand: npm start
     envVars:
       - key: NODE_ENV
@@ -17,10 +15,11 @@ services:
         value: https://laikipia-lost-found.vercel.app
       - key: PORT
         value: "5000"
+
 databases:
   - name: laikipia-db
     engine: postgres
-    version: 15
+    version: "15"
     plan: free
     databaseName: laikipia_lost_found
     user: postgres

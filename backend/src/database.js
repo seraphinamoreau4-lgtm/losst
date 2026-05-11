@@ -1,161 +1,241 @@
 const { Pool } = require('pg');
-const sqlite3 = require('sqlite3').verbose();
-const { promisify } = require('util');
+const fs = require('fs');
+const path = require('path');
 
-const usePostgres = Boolean(process.env.DATABASE_URL);
-
-let pool;
-let sqliteDb;
-let dbAll;
-let dbGet;
-let sqliteDbRun;
-
-if (usePostgres) {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  });
-
-  pool.on('error', (err) => {
-    console.error('❌ Unexpected error on idle client', err);
-    process.exit(-1);
-  });
-} else {
-  const dbPath = process.env.DB_PATH || './database/laikipia_lost_found.db';
-  sqliteDb = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-      console.error('❌ SQLite connection failed:', err.message);
-      process.exit(1);
-    }
-    console.log('✅ SQLite database connected successfully at', dbPath);
-  });
-
-  dbAll = promisify(sqliteDb.all.bind(sqliteDb));
-  dbGet = promisify(sqliteDb.get.bind(sqliteDb));
-  sqliteDbRun = (sql, params = []) => new Promise((resolve, reject) => {
-    sqliteDb.run(sql, params, function (err) {
-      if (err) return reject(err);
-      resolve({ lastID: this.lastID, changes: this.changes, insertId: this.lastID });
-    });
-  });
+// SQLite3 is optional - only load if available and not in production
+let sqlite3;
+try {
+  if (process.env.NODE_ENV !== 'production') {
+    sqlite3 = require('sqlite3').verbose();
+  }
+} catch (err) {
+  if (process.env.NODE_ENV !== 'production') {
+    console.warn('⚠️  SQLite3 not available for development fallback');
+  }
+  sqlite3 = null;
 }
 
+// Database connection
+let db = null;
+let pool = null;
+
+// Initialize database connection
+async function initDatabase() {
+  const databaseUrl = process.env.DATABASE_URL;
+
+  // In production, DATABASE_URL is required
+  if (process.env.NODE_ENV === 'production') {
+    if (!databaseUrl || !databaseUrl.startsWith('postgresql://')) {
+      console.error('❌ DATABASE_URL (PostgreSQL) is required in production');
+      throw new Error('DATABASE_URL not set or invalid');
+    }
+
+    console.log('🔄 Initializing PostgreSQL connection...');
+
+    pool = new Pool({
+      connectionString: databaseUrl,
+      ssl: { rejectUnauthorized: false },
+      max: 20,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 2000,
+    });
+
+    // Test connection
+    try {
+      const client = await pool.connect();
+      console.log('✅ PostgreSQL database connected successfully');
+      client.release();
+      return true;
+    } catch (err) {
+      console.error('❌ PostgreSQL connection failed:', err.message);
+      throw err;
+    }
+  } else {
+    // Development: Try PostgreSQL first if DATABASE_URL is set
+    if (databaseUrl && databaseUrl.startsWith('postgresql://')) {
+      console.log('🔄 Initializing PostgreSQL connection...');
+
+      pool = new Pool({
+        connectionString: databaseUrl,
+        ssl: false,
+        max: 20,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 2000,
+      });
+
+      try {
+        const client = await pool.connect();
+        console.log('✅ PostgreSQL database connected successfully');
+        client.release();
+        return true;
+      } catch (err) {
+        console.error('❌ PostgreSQL connection failed:', err.message);
+        throw err;
+      }
+    } else if (sqlite3) {
+      // Development: SQLite fallback
+      console.log('🔄 Initializing SQLite database...');
+
+      const dbPath = path.join(__dirname, '..', 'database', 'laikipia_lost_found.db');
+
+      // Ensure database directory exists
+      const dbDir = path.dirname(dbPath);
+      if (!fs.existsSync(dbDir)) {
+        fs.mkdirSync(dbDir, { recursive: true });
+      }
+
+      return new Promise((resolve, reject) => {
+        db = new sqlite3.Database(dbPath, (err) => {
+          if (err) {
+            console.error('❌ SQLite connection failed:', err.message);
+            reject(err);
+          } else {
+            console.log('✅ SQLite database connected successfully');
+            resolve(true);
+          }
+        });
+      });
+    } else {
+      throw new Error('No database available: Set DATABASE_URL or install sqlite3 for development');
+    }
+  }
+}
+
+// Generic query function (replaces ? with positional parameters for PostgreSQL)
 function normalizeSqlParams(sql, params = []) {
-  if (!sql.includes('?')) return { text: sql, values: params };
+  if (!sql.includes('?')) return { sql, params };
 
   let index = 0;
-  const text = sql.replace(/\?/g, () => {
+  const normalizedSql = sql.replace(/\?/g, () => {
     index += 1;
-    return `$${index}`;
+    return pool ? `$${index}` : `?`; // $n for PostgreSQL, ? for SQLite
   });
-  return { text, values: params };
+  return { sql: normalizedSql, params };
 }
 
-// Test connection on startup
-async function testConnection() {
-  if (!usePostgres) {
-    try {
-      await dbGet('SELECT 1');
-      console.log('✅ SQLite database connected successfully');
-    } catch (err) {
-      console.error('❌ SQLite connection failed:', err.message);
-      process.exit(1);
-    }
-    return;
-  }
-
-  try {
-    const result = await pool.query('SELECT NOW()');
-    console.log('✅ PostgreSQL database connected successfully:', result.rows[0]);
-  } catch (err) {
-    console.error('❌ PostgreSQL connection failed:', err.message);
-    process.exit(1);
-  }
-}
-
-// Helper query function
+// Helper query function for SELECT, INSERT, UPDATE, DELETE
 async function query(sql, params = []) {
+  if (!pool && !db) {
+    await initDatabase();
+  }
+
   const trimmed = sql.trim();
   const upper = trimmed.split(' ')[0].toUpperCase();
 
-  if (!usePostgres) {
-    if (upper === 'SELECT' || upper === 'PRAGMA') {
-      return await dbAll(sql, params);
-    }
-    return await sqliteDbRun(sql, params);
-  }
-
   try {
-    const { text, values } = normalizeSqlParams(sql, params);
-    const result = await pool.query(text, values);
+    const { sql: normalizedSql, params: normalizedParams } = normalizeSqlParams(sql, params);
 
-    if (upper === 'SELECT' || upper === 'WITH') {
-      return result.rows;
-    }
+    if (pool) {
+      // PostgreSQL
+      const result = await pool.query(normalizedSql, normalizedParams);
 
-    const payload = { rows: result.rows, changes: result.rowCount };
-    if (upper === 'INSERT') {
-      if (result.rows?.[0]?.id) {
-        payload.insertId = result.rows[0].id;
-      } else {
-        const last = await pool.query('SELECT LASTVAL() AS id');
-        payload.insertId = last.rows[0]?.id || null;
+      // For SELECT queries, return rows
+      if (upper === 'SELECT' || upper === 'SHOW' || upper === 'DESCRIBE') {
+        return result.rows;
       }
+
+      // For INSERT/UPDATE/DELETE, return info about the operation
+      return {
+        rows: result.rows,
+        changes: result.rowCount || 0,
+        insertId: result.rows?.[0]?.id || null
+      };
+    } else {
+      // SQLite
+      return new Promise((resolve, reject) => {
+        if (upper === 'SELECT' || upper === 'SHOW' || upper === 'DESCRIBE') {
+          db.all(normalizedSql, normalizedParams, (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+          });
+        } else {
+          db.run(normalizedSql, normalizedParams, function(err) {
+            if (err) reject(err);
+            else resolve({
+              rows: [],
+              changes: this.changes || 0,
+              insertId: this.lastID || null
+            });
+          });
+        }
+      });
     }
-    return payload;
   } catch (err) {
     console.error('❌ Query error:', err);
+    console.error('SQL:', sql);
+    console.error('Params:', params);
     throw err;
   }
 }
 
 // Helper for single row
 async function queryOne(sql, params = []) {
-  if (!usePostgres) {
-    return await dbGet(sql, params);
-  }
-
-  try {
-    const { text, values } = normalizeSqlParams(sql, params);
-    const result = await pool.query(text, values);
-    return result.rows[0] || null;
-  } catch (err) {
-    console.error('❌ Query error:', err);
-    throw err;
-  }
+  const result = await query(sql, params);
+  return result && result.length > 0 ? result[0] : null;
 }
 
 // Transaction helper
 async function transaction(callback) {
-  if (!usePostgres) {
+  if (pool) {
+    // PostgreSQL transaction
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await callback(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('❌ Transaction failed:', err);
+      throw err;
+    } finally {
+      client.release();
+    }
+  } else if (db && sqlite3) {
+    // SQLite transaction
     return new Promise((resolve, reject) => {
-      sqliteDb.run('BEGIN TRANSACTION', async (err) => {
+      db.run('BEGIN TRANSACTION', (err) => {
         if (err) return reject(err);
-        try {
-          const result = await callback(sqliteDb);
-          sqliteDb.run('COMMIT', (commitErr) => {
-            if (commitErr) reject(commitErr);
+
+        callback(db).then(result => {
+          db.run('COMMIT', (err) => {
+            if (err) reject(err);
             else resolve(result);
           });
-        } catch (err) {
-          sqliteDb.run('ROLLBACK', () => reject(err));
-        }
+        }).catch(err => {
+          db.run('ROLLBACK', () => reject(err));
+        });
       });
     });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await callback(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
+  } else {
+    throw new Error('No database connection available for transaction');
   }
 }
 
-module.exports = { testConnection, query, queryOne, transaction, pool };
+// Close database connection
+async function closeDatabase() {
+  if (pool) {
+    await pool.end();
+    console.log('📴 PostgreSQL connection closed');
+  } else if (db) {
+    db.close((err) => {
+      if (err) console.error('❌ Error closing SQLite database:', err);
+      else console.log('📴 SQLite database connection closed');
+    });
+  }
+}
+
+// Initialize on module load
+initDatabase().catch(err => {
+  console.error('Failed to initialize database:', err.message);
+  process.exit(1);
+});
+
+module.exports = { 
+  query, 
+  queryOne, 
+  transaction, 
+  closeDatabase,
+  initDatabase,
+  get pool() { return pool; }
+};
